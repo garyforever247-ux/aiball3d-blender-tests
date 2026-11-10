@@ -1,0 +1,185 @@
+name: Blender 5.2.4 synthetic smoke
+
+'on':
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: blender-5-2-4-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: ${{ github.run_attempt == 1 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Verify distribution and test synthetic cube
+        id: smoke
+        timeout-minutes: 7
+        env:
+          # Owner-supplied official-manifest digest; not independently retrieved
+          # here. Runtime requires the official manifest and archive to match.
+          BLENDER_SHA256: 2fd14c50987426897ba60237ee996edf2b4151f4b1a72a460ca20be58c1d2d86
+        run: |
+          set -euo pipefail
+          umask 077
+          work=$(mktemp -d "$RUNNER_TEMP/blender-work.XXXXXX")
+          diag=$(mktemp -d "$RUNNER_TEMP/blender-diag.XXXXXX")
+          printf 'work=%s\ndiag=%s\n' "$work" "$diag" >> "$GITHUB_OUTPUT"
+          trap 'rc=$?; printf "step_exit_status=%s\n" "$rc" > "$diag/status.txt"; exit "$rc"' EXIT
+          # Fixed, bounded diagnostics only: no env, process list or credentials.
+          {
+            printf 'os=Ubuntu 24.04\narch=%s\ncpus=%s\n' "$(uname -m)" "$(nproc)"
+            awk '/^MemTotal:/ {print "memory_total_kib=" $2}' /proc/meminfo
+            df -Pk "$work" | awk 'NR==2 {print "disk_available_kib=" $4}'
+          } > "$diag/host.txt"
+          [[ $(uname -m) == x86_64 ]]
+          [[ $BLENDER_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
+            printf 'Blocked: valid archive SHA-256 pin required.\n'
+            exit 1
+          }
+          cd "$work"
+          archive=blender-5.2.4-linux-x64.tar.xz
+          base=https://download.blender.org/release/Blender5.2
+          # No redirects, TLS bypass, credentials, mirrors, retries or fallback.
+          # Checksum is small; download itself is capped at 600 MiB / 240 s.
+          curl --disable --silent --fail --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 30 --max-filesize 16384 \
+            "$base/blender-5.2.4.sha256" -o manifest.sha256
+          python3 - "$archive" "$BLENDER_SHA256" <<'PY'
+          import pathlib, re, sys
+          archive, pin = sys.argv[1:]
+          lines = pathlib.Path('manifest.sha256').read_text('ascii').splitlines()
+          matches = []
+          for line in lines:
+              m = re.fullmatch(r'([0-9a-fA-F]{64}) [ *](\S+)', line)
+              if m and m[2] == archive:
+                  matches.append(m[1].lower())
+          if matches != [pin]:
+              raise SystemExit('Official manifest missing, duplicate or differs from owner-supplied pin')
+          pathlib.Path('archive.sha256').write_text(f'{pin}  {archive}\n', encoding='ascii')
+          PY
+          curl --disable --silent --fail --proto '=https' --tlsv1.2 \
+            --connect-timeout 15 --max-time 240 --max-filesize 629145600 \
+            "$base/$archive" -o "$archive"
+          sha256sum --check --status archive.sha256
+          printf 'archive_sha256=%s\nchecksum=verified\n' "$BLENDER_SHA256" > "$diag/download.txt"
+          # Nothing is extracted or executed before both checks pass.
+          tar --extract --xz --file "$archive" --no-same-owner --no-same-permissions
+          mkdir -p profile/config profile/scripts profile/datafiles profile/extensions tmp
+          cat > smoke.py <<'PY'
+          import json, math, os, platform
+          from pathlib import Path
+          import bpy, bmesh
+
+          result = {
+              'blender_version': bpy.app.version_string,
+              'python_version': platform.python_version(),
+              'passed': False,
+          }
+          try:
+              if tuple(bpy.app.version) != (5, 2, 4):
+                  raise RuntimeError('Unexpected Blender version')
+              bpy.ops.object.select_all(action='SELECT')
+              bpy.ops.object.delete(use_global=False)
+              bpy.ops.mesh.primitive_cube_add(size=2.0, location=(0, 0, 0))
+              obj = bpy.context.object
+              bpy.context.view_layer.update()
+              bm = bmesh.new()
+              try:
+                  bm.from_mesh(obj.data)
+                  volume = abs(bm.calc_volume(signed=True))
+              finally:
+                  bm.free()
+              dimensions = list(obj.dimensions)
+              result.update(vertices=len(obj.data.vertices), faces=len(obj.data.polygons),
+                            dimensions=dimensions, volume=volume)
+              ok = (result['vertices'] == 8 and result['faces'] == 6
+                    and all(math.isclose(x, 2.0, rel_tol=0, abs_tol=1e-6) for x in dimensions)
+                    and math.isclose(volume, 8.0, rel_tol=0, abs_tol=1e-6))
+              if not ok:
+                  raise RuntimeError('Synthetic cube geometry mismatch')
+              result['passed'] = True
+          finally:
+              Path(os.environ['SMOKE_RESULT']).write_text(json.dumps(result, indent=2) + '\n')
+          PY
+          # File-size and CPU caps apply; peak resident RAM is measured below.
+          # No rendering, GPU workload, repository checkout, add-ons or assets.
+          set +e
+          (
+            set -e
+            ulimit -c 0
+            ulimit -f 64
+            ulimit -t 120
+            /usr/bin/time -f 'elapsed_seconds=%e\nuser_cpu_seconds=%U\nsystem_cpu_seconds=%S\nmax_rss_kib=%M\nexit_status=%x' \
+              -o "$diag/resources.txt" \
+              timeout --signal=TERM --kill-after=5s 120s \
+              env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
+              HOME="$work/profile" TMPDIR="$work/tmp" \
+              XDG_CONFIG_HOME="$work/profile/config" XDG_CACHE_HOME="$work/tmp" \
+              XDG_DATA_HOME="$work/profile/datafiles" \
+              BLENDER_USER_CONFIG="$work/profile/config" \
+              BLENDER_USER_SCRIPTS="$work/profile/scripts" \
+              BLENDER_USER_DATAFILES="$work/profile/datafiles" \
+              BLENDER_USER_EXTENSIONS="$work/profile/extensions" \
+              OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+              SMOKE_RESULT="$diag/result.json" \
+              "$work/blender-5.2.4-linux-x64/blender" \
+              --background --factory-startup --disable-autoexec --offline-mode \
+              --threads 1 --python-exit-code 1 --python "$work/smoke.py"
+          ) > "$diag/blender.log" 2>&1
+          rc=$?
+          set -e
+          printf 'blender_exit_status=%s\n' "$rc" > "$diag/blender-status.txt"
+          # Publish only bounded allowlisted diagnostics, never raw runner state.
+          python3 - "$diag" "$rc" <<'PY'
+          import json, pathlib, sys
+          d = pathlib.Path(sys.argv[1])
+          caps = {'blender.log': 16384, 'resources.txt': 1024, 'result.json': 2048}
+          for name, cap in caps.items():
+              p = d / name
+              if p.exists():
+                  with p.open('rb') as f:
+                      data = f.read(cap)
+                  p.write_bytes(data)
+          p = d / 'result.json'
+          passed = p.exists() and json.loads(p.read_text()).get('passed') is True
+          if sys.argv[2] != '0' or not passed:
+              raise SystemExit('Synthetic smoke failed; inspect bounded diagnostics')
+          print('Synthetic cube passed; versions and geometry are in result.json.')
+          PY
+
+      - name: Upload bounded diagnostics
+        if: ${{ always() && steps.smoke.outputs.diag != '' }}
+        timeout-minutes: 1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: blender-5.2.4-smoke-${{ github.run_id }}
+          path: |
+            ${{ steps.smoke.outputs.diag }}/status.txt
+            ${{ steps.smoke.outputs.diag }}/host.txt
+            ${{ steps.smoke.outputs.diag }}/download.txt
+            ${{ steps.smoke.outputs.diag }}/blender-status.txt
+            ${{ steps.smoke.outputs.diag }}/resources.txt
+            ${{ steps.smoke.outputs.diag }}/result.json
+            ${{ steps.smoke.outputs.diag }}/blender.log
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 6
+          include-hidden-files: false
+
+      - name: Clean isolated work directory
+        if: ${{ always() && steps.smoke.outputs.work != '' }}
+        timeout-minutes: 1
+        env:
+          SMOKE_WORK: ${{ steps.smoke.outputs.work }}
+        run: |
+          case "$SMOKE_WORK" in
+            "$RUNNER_TEMP"/blender-work.*) rm -rf -- "$SMOKE_WORK" ;;
+            *) exit 1 ;;
+          esac
